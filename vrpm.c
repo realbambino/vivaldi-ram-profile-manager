@@ -8,9 +8,24 @@
 #include <zip.h>
 #include <dirent.h>
 #include <libgen.h>
+#include <sys/vfs.h>
+
+#define VERSION "1.0.6"
+#define BUILD_DATE __DATE__ " " __TIME__
 
 #define MIN_RAM_GB 16
-#define CMD_MAX ((PATH_MAX * 3) + 512)
+/* Set to 64KB to completely satisfy compiler worst-case truncation math */
+#define CMD_MAX 65536
+/* Path buffer plus filename buffer plus separator safety */
+#define PATH_BUFFER_MAX (PATH_MAX + 512)
+#define BAR_WIDTH 40
+
+/* ANSI Color Codes */
+#define RED    "\033[1;31m"
+#define GREEN  "\033[1;32m"
+#define YELLOW "\033[1;33m"
+#define ORANGE "\033[38;5;208m"
+#define RESET  "\033[0m"
 
 /* Global Paths */
 char PROFILE_SRC[PATH_MAX], PROFILE_RAM[] = "/dev/shm/vivaldi-profile";
@@ -18,17 +33,37 @@ char BACKUP_DIR[PATH_MAX], SYSTEMD_DIR[PATH_MAX], INSTALL_PATH[PATH_MAX];
 char SERVICE_FILE[PATH_MAX + 128];
 
 /* --------------------------------------------------
+ * UI & Progress Helpers
+ * -------------------------------------------------- */
+
+void print_progress(const char* label, double percentage) {
+    int progress = (int)(percentage * BAR_WIDTH);
+    printf("\r%s: [", label);
+    for (int i = 0; i < BAR_WIDTH; ++i) {
+        if (i < progress) printf("=");
+        else if (i == progress) printf(">");
+        else printf(" ");
+    }
+    printf("] %.1f%%", percentage * 100);
+    fflush(stdout);
+}
+
+/* --------------------------------------------------
  * Helper Functions
  * -------------------------------------------------- */
 
 void init_paths() {
     const char *home = getenv("HOME");
-    if (!home) { fprintf(stderr, "Error: $HOME not set.\n"); exit(1); }
+    if (!home) { fprintf(stderr, RED "Error: $HOME not set.\n" RESET); exit(1); }
     snprintf(PROFILE_SRC, PATH_MAX, "%s/.config/vivaldi", home);
     snprintf(BACKUP_DIR, PATH_MAX, "%s/Backups/vivaldi-profile-ram", home);
     snprintf(SYSTEMD_DIR, PATH_MAX, "%s/.config/systemd/user", home);
     snprintf(INSTALL_PATH, PATH_MAX, "%s/.local/bin/vivaldi-ram-profile", home);
     snprintf(SERVICE_FILE, sizeof(SERVICE_FILE), "%s/vivaldi-ram-profile.service", SYSTEMD_DIR);
+}
+
+int is_rsync_installed() {
+    return (system("command -v rsync >/dev/null 2>&1") == 0);
 }
 
 int is_vivaldi_running() {
@@ -48,10 +83,77 @@ int confirm(const char *msg) {
     return 0;
 }
 
+unsigned long get_dir_size(const char *path) {
+    char cmd[CMD_MAX];
+    snprintf(cmd, sizeof(cmd), "du -sb \"%s\" 2>/dev/null", path);
+    FILE *fp = popen(cmd, "r");
+    unsigned long size = 0;
+    if (fp) { if (fscanf(fp, "%lu", &size) != 1) size = 0; pclose(fp); }
+    return size;
+}
+
+void handle_check_ram() {
+    unsigned long profile_size = get_dir_size(PROFILE_SRC);
+    struct statfs s;
+    if (statfs("/dev/shm", &s) != 0) {
+        printf(RED "Error: Could not check RAM disk status.\n" RESET);
+        return;
+    }
+    unsigned long free_ram = s.f_bsize * s.f_bavail;
+
+    printf("Profile size   : " ORANGE "%.2f MB" RESET "\n", (double)profile_size / (1024 * 1024));
+    printf("Available RAM  : %.2f MB\n", (double)free_ram / (1024 * 1024));
+
+    if (profile_size > free_ram) {
+        printf(RED "Insufficient RAM to load profile!\n" RESET);
+    } else {
+        printf(GREEN "\nProfile fits in RAM.\n" RESET);
+    }
+}
+
+void show_status() {
+    printf("=== RAM status ===\n  RAM active : %s\n\n", is_mounted() ? "yes" : "no");
+    printf("=== Vivaldi status ===\n  Running    : %s\n\n", is_vivaldi_running() ? "yes" : "no");
+    
+    DIR *d = opendir(BACKUP_DIR);
+    int count = 0;
+    char latest[PATH_MAX] = "none";
+    time_t ltime = 0;
+    off_t lsize = 0;
+
+    if (d) {
+        struct dirent *dir;
+        while ((dir = readdir(d))) {
+            if (strstr(dir->d_name, ".zip")) {
+                count++;
+                char p[PATH_BUFFER_MAX];
+                snprintf(p, sizeof(p), "%s/%s", BACKUP_DIR, dir->d_name);
+                struct stat st;
+                if (stat(p, &st) == 0 && st.st_mtime > ltime) {
+                    ltime = st.st_mtime;
+                    lsize = st.st_size;
+                    strncpy(latest, dir->d_name, PATH_MAX);
+                }
+            }
+        }
+        closedir(d);
+    }
+
+    printf("=== Backup status ===\n");
+    printf("  Path       : %s\n", BACKUP_DIR);
+    printf("  Count      : %d\n", count);
+    if (count > 0) {
+        printf("  Latest     : %s " ORANGE "(%.2f MB)" RESET "\n", latest, (double)lsize / (1024 * 1024));
+    } else {
+        printf("  Latest     : %s\n", latest);
+    }
+}
+
 void show_usage(const char *prog_path) {
-    char *prog_name = strdup(prog_path);
+    char *p_copy = strdup(prog_path);
+    char *prog_name = basename(p_copy);
     printf("Vivaldi RAM Profile Manager\n\n");
-    printf("Usage: %s [OPTIONS]\n\n", basename(prog_name));
+    printf("Usage: %s [OPTIONS]\n\n", prog_name);
     printf("OPTIONS\n");
     printf("  -i, --install         Install and enable RAM profile service\n");
     printf("  -d, --disable         Disable the service (keep files)\n");
@@ -63,256 +165,253 @@ void show_usage(const char *prog_path) {
     printf("  -b, --backup          Create ZIP backup (RAM must be active)\n");
     printf("  -R, --restore         Restore the latest backup\n");
     printf("  -e, --restore-select  Restore a selected backup (interactive)\n");
-    printf("  -l, --clean-backup    Delete all backups except the latest\n");
+    printf("  -n, --clean-backup    Delete all backups except the latest\n");
     printf("  -p, --purge-backup    Delete ALL backup files\n");
-    printf("  -h, --sudo-help       Show optional password-less sudo mount instructions\n\n");
-    printf("Note: Install 'pv' to show progressbar when creating backup.\n");
-    free(prog_name);
+    printf("  -h, --sudo-help       Show password-less sudo mount instructions\n\n");
+    free(p_copy);
 }
 
-void show_status() {
-    printf("=== RAM status ===\n");
-    printf("  RAM active : %s\n\n", is_mounted() ? "yes" : "no");
-    printf("=== Vivaldi status ===\n");
-    printf("  Running    : %s\n\n", is_vivaldi_running() ? "yes" : "no");
-    printf("=== Backup status ===\n");
-    printf("  Backup path   : %s\n", BACKUP_DIR);
+void show_sudo_help() {
+    printf("Version: %s\n", VERSION);
+    printf("Build Date: %s\n", BUILD_DATE);
+    printf("\n============================================\n");
+    printf(" Password-less mount/umount configuration\n");
+    printf("============================================\n\n");
+    printf("1) Open sudoers:  sudo visudo\n");
+    printf("2) Add this line to the end (replace %s with your user):\n\n", getenv("USER"));
+    printf("   %s ALL=(root) NOPASSWD: \\\n", getenv("USER") ? getenv("USER") : "USERNAME");
+    printf("     /usr/bin/mount --bind /dev/shm/vivaldi-profile %s, \\\n", PROFILE_SRC);
+    printf("     /usr/bin/umount %s\n\n", PROFILE_SRC);
+    printf("3) Save and exit. The script will now run silently.\n");
+}
 
-    DIR *d = opendir(BACKUP_DIR);
-    if (!d) {
-        printf("  Backup dir    : not created\n");
-        return;
+/* --------------------------------------------------
+ * Core Handlers
+ * -------------------------------------------------- */
+
+void handle_save() {
+    if (!is_mounted()) { printf(YELLOW "Profile is not mounted in RAM.\n" RESET); return; }
+    if (is_vivaldi_running()) { if (!confirm("Vivaldi is running. Save anyway?")) return; }
+
+    char cmd[CMD_MAX];
+    printf("Unmounting profile...\n");
+    snprintf(cmd, sizeof(cmd), "sudo umount \"%s\"", PROFILE_SRC);
+    if (system(cmd) != 0) { printf(RED "Error: Could not unmount.\n" RESET); return; }
+
+    printf("Syncing RAM to Disk...\n");
+    snprintf(cmd, sizeof(cmd), "rsync -a --delete --info=progress2 \"%s/\" \"%s/\"", PROFILE_RAM, PROFILE_SRC);
+    
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            int pct;
+            if (sscanf(line, "%*s %d%%", &pct) == 1) {
+                print_progress("Syncing", (double)pct / 100.0);
+            }
+        }
+        pclose(fp);
+    }
+    
+    snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", PROFILE_RAM);
+    system(cmd);
+    printf(GREEN "\nProfile saved successfully.\n" RESET);
+}
+
+void perform_restore(const char *zip_path) {
+    int err = 0;
+    struct zip *za = zip_open(zip_path, 0, &err);
+    if (!za) { printf(RED "Error: Failed to open ZIP: %s\n" RESET, zip_path); return; }
+
+    zip_int64_t num_entries = zip_get_num_entries(za, 0);
+    zip_uint64_t total_size = 0;
+    for (zip_int64_t i = 0; i < num_entries; i++) {
+        struct zip_stat st;
+        zip_stat_index(za, i, 0, &st);
+        total_size += st.size;
     }
 
-    struct dirent *dir;
-    char latest_file[PATH_MAX] = "";
-    time_t latest_time = 0;
-    int backup_count = 0;
+    zip_uint64_t processed = 0;
+    for (zip_int64_t i = 0; i < num_entries; i++) {
+        struct zip_stat st;
+        zip_stat_index(za, i, 0, &st);
+        char out_path[PATH_BUFFER_MAX];
+        snprintf(out_path, sizeof(out_path), "%s/%s", PROFILE_SRC, st.name);
 
-    while ((dir = readdir(d)) != NULL) {
-        if (strstr(dir->d_name, ".zip")) {
-            backup_count++;
-            char full_path[CMD_MAX];
-            snprintf(full_path, sizeof(full_path), "%s/%s", BACKUP_DIR, dir->d_name);
-            struct stat st;
-            if (stat(full_path, &st) == 0) {
-                if (st.st_mtime > latest_time) {
-                    latest_time = st.st_mtime;
-                    strncpy(latest_file, dir->d_name, PATH_MAX);
+        if (st.name[strlen(st.name) - 1] == '/') {
+            mkdir(out_path, 0755);
+        } else {
+            struct zip_file *zf = zip_fopen_index(za, i, 0);
+            FILE *out = fopen(out_path, "wb");
+            if (zf && out) {
+                char buffer[8192]; zip_int64_t n;
+                while ((n = zip_fread(zf, buffer, sizeof(buffer))) > 0) {
+                    fwrite(buffer, 1, n, out);
+                    processed += n;
+                    print_progress("Restoring", (double)processed / (total_size ? total_size : 1));
                 }
+                fclose(out); zip_fclose(zf);
             }
         }
     }
-    closedir(d);
-
-    if (backup_count > 0) {
-        time_t now = time(NULL);
-        int age_days = (int)((now - latest_time) / 86400);
-        printf("  Backups found : %d\n", backup_count);
-        printf("  Latest backup : %s\n", latest_file);
-        printf("  Age (days)    : %d\n", age_days);
-        if (age_days > 7) printf("  ⚠️ WARNING     : Last backup > 7 days\n");
-    } else {
-        printf("  Backups found : none\n");
-    }
+    zip_close(za);
+    printf(GREEN "\nRestore complete.\n" RESET);
 }
 
-void show_sudo_nopasswd_instructions() {
-    printf("\n==================================================\n");
-    printf(" OPTIONAL: Password-less mount/umount configuration\n");
-    printf("==================================================\n\n");
-    printf("This is OPTIONAL. The script works fine without it.\n\n");
-    printf("If you want to avoid entering your sudo password\n");
-    printf("when loading or saving the Vivaldi RAM profile:\n\n");
-    printf("1) Open sudoers safely:\n\n   sudo visudo\n\n");
-    printf("2) Add this line at the end (replace USERNAME):\n\n");
-    printf("   %s ALL=(root) NOPASSWD: \\\n", getenv("USER") ? getenv("USER") : "USERNAME");
-    printf("     /bin/mount --bind /dev/shm/vivaldi-profile %s, \\\n", PROFILE_SRC);
-    printf("     /bin/umount %s\n\n", PROFILE_SRC);
-    printf("3) Save and exit.\n\n");
-    printf("✔ After this, --load and --save will not ask for a password.\n");
-}
+void handle_restore(int interactive) {
+    if (!is_mounted()) { printf(RED "Error: RAM profile not active.\n" RESET); return; }
+    DIR *d = opendir(BACKUP_DIR);
+    if (!d) { printf(RED "Error: Backup directory not found.\n" RESET); return; }
 
-/* --------------------------------------------------
- * RAM & Logic Handlers
- * -------------------------------------------------- */
-
-long get_mem_kb(const char *key) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return -1;
-    char label[64]; long value;
-    while (fscanf(fp, "%63s %ld kB", label, &value) != EOF) {
-        if (strcmp(label, key) == 0) { fclose(fp); return value; }
-    }
-    fclose(fp); return -1;
-}
-
-unsigned long get_dir_size(const char *path) {
-    char cmd[CMD_MAX];
-    snprintf(cmd, sizeof(cmd), "du -sb \"%s\" 2>/dev/null", path);
-    FILE *fp = popen(cmd, "r");
-    unsigned long size = 0;
-    if (fp) { if (fscanf(fp, "%lu", &size) != 1) size = 0; pclose(fp); }
-    return size;
-}
-
-int check_profile_vs_ram() {
-    unsigned long profile_bytes = get_dir_size(PROFILE_SRC);
-    long profile_mb = profile_bytes / 1024 / 1024;
-    long available_kb = get_mem_kb("MemAvailable:");
-    long available_mb = available_kb / 1024;
-    long required_mb = profile_mb * 2;
-
-    printf("Profile size     : %ld MB\n", profile_mb);
-    printf("Available RAM    : %ld MB\n", available_mb);
-    printf("Required RAM     : %ld MB (2× rule)\n", required_mb);
-    return (available_mb >= required_mb);
-}
-
-/* --------------------------------------------------
- * Backup & Restore (Native libzip)
- * -------------------------------------------------- */
-
-void add_to_zip(struct zip *za, const char *base, const char *rel) {
-    char full[CMD_MAX];
-    snprintf(full, sizeof(full), "%s/%s", base, rel);
-    struct stat st;
-    if (stat(full, &st) != 0) return;
-    if (S_ISDIR(st.st_mode)) {
-        zip_dir_add(za, rel, ZIP_FL_ENC_UTF_8);
-        DIR *d = opendir(full);
-        if (!d) return;
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-            char next_rel[PATH_MAX];
-            snprintf(next_rel, sizeof(next_rel), "%s/%s", rel, e->d_name);
-            add_to_zip(za, base, next_rel);
+    struct dirent *dir;
+    char files[128][PATH_BUFFER_MAX]; time_t times[128]; int count = 0;
+    while ((dir = readdir(d)) != NULL && count < 128) {
+        if (strstr(dir->d_name, ".zip")) {
+            snprintf(files[count], sizeof(files[count]), "%s/%s", BACKUP_DIR, dir->d_name);
+            struct stat st; stat(files[count], &st);
+            times[count] = st.st_mtime; count++;
         }
-        closedir(d);
-    } else {
-        struct zip_source *s = zip_source_file(za, full, 0, 0);
-        if (s) zip_file_add(za, rel, s, ZIP_FL_OVERWRITE);
     }
+    closedir(d);
+    if (count == 0) { printf(RED "Error: No backups found.\n" RESET); return; }
+
+    int pick = 0;
+    if (interactive) {
+        printf("\nAvailable Backups:\n");
+        for (int i = 0; i < count; i++) {
+            struct stat st; stat(files[i], &st);
+            printf("[%d] %s " ORANGE "(%.2f MB)" RESET "\n", i + 1, basename(files[i]), (double)st.st_size / (1024 * 1024));
+        }
+        printf("Select (1-%d) or 'x' to cancel: ", count);
+        char input[10];
+        if (!fgets(input, sizeof(input), stdin)) return;
+        if (input[0] == 'x' || input[0] == 'X') {
+            printf("\nRestore cancelled.\n");
+            return;
+        }
+        pick = atoi(input);
+        if (pick < 1 || pick > count) {
+            printf(RED "Invalid selection.\n" RESET);
+            return;
+        }
+        pick--;
+    } else {
+        for (int i = 1; i < count; i++) if (times[i] > times[pick]) pick = i;
+    }
+    perform_restore(files[pick]);
 }
 
-void handle_backup() {
-    printf("=== Creating Backup ===\n");
-    if (!is_mounted()) { printf("❌ RAM profile not active.\n"); exit(1); }
-    
-    char cmd[CMD_MAX], ts[64], path[CMD_MAX];
-    snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", BACKUP_DIR); system(cmd);
-    
-    time_t now = time(NULL);
-    strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", localtime(&now));
-    snprintf(path, sizeof(path), "%s/vivaldi-profile-%s.zip", BACKUP_DIR, ts);
-
-    unsigned long total_size = get_dir_size(PROFILE_SRC);
-    printf("Backing up profile to ZIP: %s\n", path);
-
-    // This recreates your bash pipeline exactly
-    snprintf(cmd, sizeof(cmd), 
-             "cd \"%s\" && tar -cf - . | pv -s %lu | zip -q -9 \"%s\" -", 
-             PROFILE_SRC, total_size, path);
-    
-    if (system(cmd) == 0) {
-        printf("\n✅ Backup completed successfully.\n");
-    } else {
-        printf("\n❌ Backup failed. Ensure 'pv' and 'zip' are installed.\n");
+void handle_clean_backups() {
+    DIR *d = opendir(BACKUP_DIR);
+    if (!d) return;
+    struct dirent *dir;
+    char latest[PATH_MAX] = ""; time_t ltime = 0;
+    while ((dir = readdir(d))) {
+        if (strstr(dir->d_name, ".zip")) {
+            char p[PATH_BUFFER_MAX]; snprintf(p, sizeof(p), "%s/%s", BACKUP_DIR, dir->d_name);
+            struct stat st; stat(p, &st);
+            if (st.st_mtime > ltime) { ltime = st.st_mtime; strncpy(latest, dir->d_name, PATH_MAX); }
+        }
     }
+    rewinddir(d);
+    while ((dir = readdir(d))) {
+        if (strstr(dir->d_name, ".zip") && strcmp(dir->d_name, latest) != 0) {
+            char p[PATH_BUFFER_MAX]; snprintf(p, sizeof(p), "%s/%s", BACKUP_DIR, dir->d_name);
+            remove(p);
+        }
+    }
+    closedir(d);
+    printf(GREEN "\nOld backups cleaned. Kept: %s\n" RESET, latest);
+}
+
+void handle_purge_backups() {
+    if (!confirm("Are you sure you want to delete ALL backup files?")) return;
+    DIR *d = opendir(BACKUP_DIR);
+    if (!d) { printf(YELLOW "Backup directory does not exist.\n" RESET); return; }
+    struct dirent *dir;
+    int deleted_count = 0;
+    while ((dir = readdir(d))) {
+        if (strstr(dir->d_name, ".zip")) {
+            char p[PATH_BUFFER_MAX];
+            snprintf(p, sizeof(p), "%s/%s", BACKUP_DIR, dir->d_name);
+            if (remove(p) == 0) deleted_count++;
+        }
+    }
+    closedir(d);
+    printf(GREEN "\nPurged %d backup files.\n" RESET, deleted_count);
 }
 
 /* --------------------------------------------------
- * Main Logic
+ * Main
  * -------------------------------------------------- */
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) { init_paths(); show_usage(argv[0]); return 0; }
     init_paths();
+    if (argc < 2) { show_usage(argv[0]); return 0; }
     char *action = argv[1];
 
     if (strcmp(action, "--install") == 0 || strcmp(action, "-i") == 0) {
         char cmd[CMD_MAX];
-        snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\" && mkdir -p \"$(dirname %s)\"", SYSTEMD_DIR, INSTALL_PATH);
-        system(cmd);
-        snprintf(cmd, sizeof(cmd), "cp \"%s\" \"%s\" && chmod +x \"%s\"", argv[0], INSTALL_PATH, INSTALL_PATH);
-        system(cmd);
+        snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\" && mkdir -p \"$(dirname %s)\"", SYSTEMD_DIR, INSTALL_PATH); system(cmd);
+        snprintf(cmd, sizeof(cmd), "cp \"%s\" \"%s\" && chmod +x \"%s\"", argv[0], INSTALL_PATH, INSTALL_PATH); system(cmd);
         FILE *f = fopen(SERVICE_FILE, "w");
         if (f) {
-            fprintf(f, "[Unit]\nDescription=Vivaldi RAM Profile Manager\nAfter=graphical-session.target\n\n"
-                       "[Service]\nType=oneshot\nExecStart=%s --load\nExecStop=%s --save\nRemainAfterExit=yes\n\n"
-                       "[Install]\nWantedBy=default.target\n", INSTALL_PATH, INSTALL_PATH);
-            fclose(f);
-            system("systemctl --user daemon-reload && systemctl --user enable vivaldi-ram-profile.service");
-            printf("✅ Service installed and enabled.\n");
-            if (confirm("Show OPTIONAL password-less sudo instructions?")) show_sudo_nopasswd_instructions();
+            fprintf(f, "[Unit]\nDescription=Vivaldi RAM Profile\nAfter=graphical-session.target\n\n[Service]\nType=oneshot\nExecStart=%s --load\nExecStop=%s --save\nRemainAfterExit=yes\n\n[Install]\nWantedBy=default.target\n", INSTALL_PATH, INSTALL_PATH);
+            fclose(f); system("systemctl --user daemon-reload && systemctl --user enable vivaldi-ram-profile.service");
+            printf(GREEN "Service installed and enabled.\n" RESET);
         }
     } 
-    else if (strcmp(action, "--disable") == 0 || strcmp(action, "-d") == 0) {
-        system("systemctl --user disable vivaldi-ram-profile.service 2>/dev/null || true");
-        printf("✅ Service disabled.\n");
-    }
-    else if (strcmp(action, "--remove") == 0 || strcmp(action, "-r") == 0) {
-        system("systemctl --user disable vivaldi-ram-profile.service 2>/dev/null || true");
-        remove(SERVICE_FILE);
-        if (confirm("Delete installed script?")) remove(INSTALL_PATH);
-        if (confirm("Delete backup directory?")) {
-            char cmd[CMD_MAX];
-            snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", BACKUP_DIR);
-            system(cmd);
-        }
-        printf("✅ Service and files removed.\n");
-    }
     else if (strcmp(action, "--load") == 0 || strcmp(action, "-l") == 0) {
-        printf("=== Vivaldi Profile RAM Loader ===\n");
-        struct stat st;
-        if (stat(PROFILE_SRC, &st) != 0) { printf("❌ Vivaldi profile not found at:\n  %s\n", PROFILE_SRC); return 1; }
-        if (is_mounted()) { printf("ℹ️ Vivaldi profile is already mounted in RAM.\n"); return 0; }
-        if (is_vivaldi_running()) { printf("⚠️ Vivaldi is currently running.\n"); if (!confirm("Continue anyway?")) return 1; }
-        printf("Preparing RAM directory...\n");
+        if (!is_rsync_installed()) {
+            printf(RED "Error: 'rsync' is not installed. Please install it to continue.\n" RESET);
+            return 1;
+        }
+        if (is_mounted()) { printf(YELLOW "Already in RAM.\n" RESET); return 0; }
+        
         char cmd[CMD_MAX];
         snprintf(cmd, sizeof(cmd), "mkdir -p %s", PROFILE_RAM); system(cmd);
-        printf("Copying Vivaldi profile to RAM...\n");
-        snprintf(cmd, sizeof(cmd), "rsync -a --delete \"%s/\" \"%s/\"", PROFILE_SRC, PROFILE_RAM); system(cmd);
-        printf("Mounting RAM profile...\n");
-        snprintf(cmd, sizeof(cmd), "sudo mount --bind \"%s\" \"%s\"", PROFILE_RAM, PROFILE_SRC); system(cmd);
-        printf("\n✅ Vivaldi profile is now running from RAM.\n\nIMPORTANT:\n• Do NOT delete %s while mounted\n• Run --save before shutdown to persist changes\n", PROFILE_RAM);
-    }
-    else if (strcmp(action, "--save") == 0 || strcmp(action, "-s") == 0) {
-        if (!is_mounted()) return 0;
-        if (is_vivaldi_running()) { if (!confirm("Vivaldi running. Continue?")) return 1; }
-        char cmd[CMD_MAX];
-        snprintf(cmd, sizeof(cmd), "sudo umount \"%s\"", PROFILE_SRC); system(cmd);
-        snprintf(cmd, sizeof(cmd), "rsync -a --delete \"%s/\" \"%s/\"", PROFILE_RAM, PROFILE_SRC); system(cmd);
-        snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", PROFILE_RAM); system(cmd);
-        printf("✅ Profile saved.\n");
-    }
-    else if (strcmp(action, "--status") == 0 || strcmp(action, "-S") == 0) show_status();
-    else if (strcmp(action, "--check-ram") == 0 || strcmp(action, "-c") == 0) {
-        if (check_profile_vs_ram()) printf("✅ RAM OK\n"); else printf("⚠️ RAM insufficient\n");
-    }
-    else if (strcmp(action, "--backup") == 0 || strcmp(action, "-b") == 0) handle_backup();
-    else if (strcmp(action, "--restore") == 0 || strcmp(action, "-R") == 0) {
-        if (!is_mounted()) { printf("❌ RAM not active.\n"); return 1; }
-        // Note: Implementation of finding latest zip would go here, similar to status logic.
-        printf("Restore latest backup feature triggered.\n");
-    }
-    else if (strcmp(action, "--restore-select") == 0 || strcmp(action, "-e") == 0) {
-        if (!is_mounted()) { printf("❌ RAM not active.\n"); return 1; }
-        printf("Interactive restore select triggered.\n");
-    }
-    else if (strcmp(action, "--clean-backup") == 0) { // Note: original shell used -l for clean, but -l is for load. 
-        printf("Cleaning old backups...\n");
-    }
-    else if (strcmp(action, "--purge-backup") == 0 || strcmp(action, "-p") == 0) {
-        if (confirm("Delete ALL backup files?")) {
-            char cmd[CMD_MAX];
-            snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", BACKUP_DIR);
-            system(cmd);
-            printf("✅ All backups deleted.\n");
+        
+        printf("Copying profile to RAM...\n");
+        snprintf(cmd, sizeof(cmd), "rsync -a --delete --info=progress2 \"%s/\" \"%s/\"", PROFILE_SRC, PROFILE_RAM);
+        FILE *fp = popen(cmd, "r");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                int pct;
+                if (sscanf(line, "%*s %d%%", &pct) == 1) {
+                    print_progress("Loading", (double)pct / 100.0);
+                }
+            }
+            pclose(fp);
+            printf("\n");
+        }
+
+        snprintf(cmd, sizeof(cmd), "sudo mount --bind \"%s\" \"%s\"", PROFILE_RAM, PROFILE_SRC); 
+        if (system(cmd) == 0) {
+            printf(GREEN "\nLoaded successfully.\n" RESET);
+        } else {
+            printf(RED "Error: Failed to mount profile.\n" RESET);
         }
     }
-    else if (strcmp(action, "--sudo-help") == 0 || strcmp(action, "-h") == 0) show_sudo_nopasswd_instructions();
+    else if (strcmp(action, "--save") == 0 || strcmp(action, "-s") == 0) handle_save();
+    else if (strcmp(action, "--backup") == 0 || strcmp(action, "-b") == 0) {
+        if (!is_mounted()) { printf(RED "Error: RAM profile not active.\n" RESET); return 1; }
+        char cmd[CMD_MAX], ts[64], b_path[PATH_BUFFER_MAX];
+        snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", BACKUP_DIR); system(cmd);
+        time_t now = time(NULL); strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", localtime(&now));
+        snprintf(b_path, sizeof(b_path), "%s/vivaldi-profile-%s.zip", BACKUP_DIR, ts);
+        unsigned long total_size = get_dir_size(PROFILE_SRC);
+        printf("Backing up to: %s\n", b_path);
+        snprintf(cmd, sizeof(cmd), "cd \"%s\" && tar -cf - . | pv -s %lu | zip -q -9 \"%s\" -", PROFILE_SRC, total_size, b_path);
+        system(cmd); printf(GREEN "\nBackup done.\n" RESET);
+    }
+    else if (strcmp(action, "--restore") == 0 || strcmp(action, "-R") == 0) handle_restore(0);
+    else if (strcmp(action, "--restore-select") == 0 || strcmp(action, "-e") == 0) handle_restore(1);
+    else if (strcmp(action, "--clean-backup") == 0 || strcmp(action, "-n") == 0) handle_clean_backups();
+    else if (strcmp(action, "--purge-backup") == 0 || strcmp(action, "-p") == 0) handle_purge_backups();
+    else if (strcmp(action, "--sudo-help") == 0 || strcmp(action, "-h") == 0) show_sudo_help();
+    else if (strcmp(action, "--status") == 0 || strcmp(action, "-S") == 0) show_status();
+    else if (strcmp(action, "--check-ram") == 0 || strcmp(action, "-c") == 0) handle_check_ram();
     else { show_usage(argv[0]); }
 
     return 0;
