@@ -10,7 +10,7 @@
 #include <libgen.h>
 #include <sys/vfs.h>
 
-#define VERSION "1.0.6"
+#define VERSION "1.0.8"
 #define BUILD_DATE __DATE__ " " __TIME__
 
 #define MIN_RAM_GB 16
@@ -153,7 +153,7 @@ void show_usage(const char *prog_path) {
     char *p_copy = strdup(prog_path);
     char *prog_name = basename(p_copy);
     printf("Vivaldi RAM Profile Manager v%s\n", VERSION);
-    printf("Written by: Ino Jacob. This program is\n\n");
+    printf("Copyright (C) 2025 Ino Jacob. All rights reserved.\n\n");
     printf("Usage: %s [OPTIONS]\n\n", prog_name);
     printf("OPTIONS\n");
     printf("  -i, --install         Install and enable RAM profile service\n");
@@ -169,6 +169,9 @@ void show_usage(const char *prog_path) {
     printf("  -n, --clean-backup    Delete all backups except the latest\n");
     printf("  -p, --purge-backup    Delete ALL backup files\n");
     printf("  -h, --sudo-help       Show password-less sudo mount instructions\n\n");
+    printf("NOTE: This software is provided \"AS IS\", without warranty of any kind. Use it at your own risk.\n");
+    printf("      The author is not responsible for any damages resulting from its use.\n");
+
     free(p_copy);
 }
 
@@ -184,7 +187,9 @@ void show_sudo_help() {
     printf("     /usr/bin/mount --bind /dev/shm/vivaldi-profile %s, \\\n", PROFILE_SRC);
     printf("     /usr/bin/umount %s\n\n", PROFILE_SRC);
     printf("3) Save and exit. The script will now run silently.\n\n");
+    printf("--=[ NOTICE ]=------------------------------------------------------------------------------------\n");
     printf("THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,\nINCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR\nPURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE\nLIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR\nOTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS\nIN THE SOFTWARE.\n");
+    printf("--------------------------------------------------------------------------------------------------\n");
 
 }
 
