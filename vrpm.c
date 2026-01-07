@@ -152,7 +152,8 @@ void show_status() {
 void show_usage(const char *prog_path) {
     char *p_copy = strdup(prog_path);
     char *prog_name = basename(p_copy);
-    printf("Vivaldi RAM Profile Manager\n\n");
+    printf("Vivaldi RAM Profile Manager v%s\n", VERSION);
+    printf("Written by: Ino Jacob. This program is\n\n");
     printf("Usage: %s [OPTIONS]\n\n", prog_name);
     printf("OPTIONS\n");
     printf("  -i, --install         Install and enable RAM profile service\n");
@@ -182,7 +183,9 @@ void show_sudo_help() {
     printf("   %s ALL=(root) NOPASSWD: \\\n", getenv("USER") ? getenv("USER") : "USERNAME");
     printf("     /usr/bin/mount --bind /dev/shm/vivaldi-profile %s, \\\n", PROFILE_SRC);
     printf("     /usr/bin/umount %s\n\n", PROFILE_SRC);
-    printf("3) Save and exit. The script will now run silently.\n");
+    printf("3) Save and exit. The script will now run silently.\n\n");
+    printf("THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,\nINCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR\nPURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE\nLIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR\nOTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS\nIN THE SOFTWARE.\n");
+
 }
 
 /* --------------------------------------------------
